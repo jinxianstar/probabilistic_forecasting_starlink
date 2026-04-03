@@ -56,24 +56,33 @@ def interval_metrics(y_true, lower, upper, alpha):
 
     return coverage, width, winkler_mean
 
-
 def plot_prediction_from_predictions(
     y_true,
     y_pred,
-    timestamps,
-    rain_mask,
+    timestamps=None,
+    rain_mask=None,
     title="Prediction",
     n=1000
 ):
     y_true = np.asarray(y_true).reshape(-1)
     y_pred = np.asarray(y_pred)
-    timestamps = pd.to_datetime(timestamps)
-    rain_mask = np.asarray(rain_mask).astype(bool)
 
     y_true = y_true[:n]
     y_pred = y_pred[:n]
-    timestamps = timestamps[:n]
-    rain_mask = rain_mask[:n]
+
+    # 若沒給 timestamps，改用整數索引
+    if timestamps is None:
+        x = np.arange(len(y_true))
+        use_datetime = False
+    else:
+        x = pd.to_datetime(timestamps)[:n]
+        use_datetime = True
+
+    # 若沒給 rain_mask，就全部設 False
+    if rain_mask is None:
+        rain_mask = np.zeros(len(y_true), dtype=bool)
+    else:
+        rain_mask = np.asarray(rain_mask).astype(bool)[:n]
 
     q05 = y_pred[:, 0]
     q25 = y_pred[:, 1]
@@ -83,33 +92,41 @@ def plot_prediction_from_predictions(
 
     plt.figure(figsize=(16, 6))
 
-    # 雨天背景
-    for i in range(len(timestamps)):
-        if rain_mask[i]:
-            plt.axvspan(
-                timestamps[i] - pd.Timedelta(minutes=30),
-                timestamps[i] + pd.Timedelta(minutes=30),
-                alpha=0.10
-            )
+    # 雨天背景（只有有提供 timestamps 時才適合畫時間區塊）
+    if use_datetime:
+        for i in range(len(x)):
+            if rain_mask[i]:
+                plt.axvspan(
+                    x[i] - pd.Timedelta(minutes=30),
+                    x[i] + pd.Timedelta(minutes=30),
+                    alpha=0.10
+                )
+    else:
+        for i in range(len(x)):
+            if rain_mask[i]:
+                plt.axvspan(i - 0.5, i + 0.5, alpha=0.10)
 
     # prediction interval
-    plt.fill_between(timestamps, q05, q95, alpha=0.20, label="90% interval")
-    plt.fill_between(timestamps, q25, q75, alpha=0.35, label="50% interval")
+    plt.fill_between(x, q05, q95, alpha=0.20, label="90% interval")
+    plt.fill_between(x, q25, q75, alpha=0.35, label="50% interval")
 
     # 中心預測
-    plt.plot(timestamps, median, linewidth=2, label="Prediction")
+    plt.plot(x, median, linewidth=2, label="Prediction")
 
     # 真值點
-    plt.scatter(timestamps, y_true, s=14, label="True")
+    plt.scatter(x, y_true, s=14, label="True")
 
     plt.title(title)
-    plt.xlabel("Time")
+    plt.xlabel("Time" if use_datetime else "Index")
     plt.ylabel("Download Mean")
     plt.legend()
-    plt.xticks(rotation=45)
+
+    if use_datetime:
+        plt.xticks(rotation=45)
+
     plt.tight_layout()
     plt.show()
-    
+
 def evaluate_quantiles(model, X, y_true):
     y_true = np.asarray(y_true).reshape(-1)
     y_pred = model.predict(X, verbose=0)
@@ -140,10 +157,76 @@ def evaluate_quantiles(model, X, y_true):
 
     return result
 
-def evaluate_from_predictions(y_true, y_pred, rain_mask):
+# def evaluate_from_predictions(y_true, y_pred, rain_mask=None):
+#     y_true = np.asarray(y_true).reshape(-1)
+#     y_pred = np.asarray(y_pred)
+
+#     if rain_mask is not None:
+#         rain_mask = np.asarray(rain_mask).astype(bool)
+
+#     def _eval_subset(name, mask):
+#         y_s = y_true[mask]
+#         p_s = y_pred[mask]
+
+#         if len(y_s) == 0:
+#             return {
+#                 "Subset": name,
+#                 "Count": 0,
+#                 "Cov_90": np.nan,
+#                 "Width_90": np.nan,
+#                 "Winkler_90": np.nan,
+#                 "Cov_50": np.nan,
+#                 "Width_50": np.nan,
+#                 "Winkler_50": np.nan,
+#             }
+
+#         q05 = p_s[:, 0]
+#         q25 = p_s[:, 1]
+#         q75 = p_s[:, 2]
+#         q95 = p_s[:, 3]
+
+#         cov_90, width_90, winkler_90 = interval_metrics(y_s, q05, q95, alpha=0.1)
+#         cov_50, width_50, winkler_50 = interval_metrics(y_s, q25, q75, alpha=0.5)
+
+#         return {
+#             "Subset": name,
+#             "Count": len(y_s),
+#             "Cov_90": cov_90,
+#             "Width_90": width_90,
+#             "Winkler_90": winkler_90,
+#             "Cov_50": cov_50,
+#             "Width_50": width_50,
+#             "Winkler_50": winkler_50,
+#         }
+
+#     rows = [
+#         _eval_subset("all", np.ones(len(y_true), dtype=bool)),
+#     ]
+
+#     if rain_mask is not None:
+#         rows.extend([
+#             _eval_subset("rain", rain_mask),
+#             _eval_subset("non_rain", ~rain_mask),
+#         ])
+
+#     return pd.DataFrame(rows)
+
+def evaluate_from_predictions(y_true, y_pred, rain_mask=None):
     y_true = np.asarray(y_true).reshape(-1)
     y_pred = np.asarray(y_pred)
-    rain_mask = np.asarray(rain_mask).astype(bool)
+
+    if rain_mask is not None:
+        rain_mask = np.asarray(rain_mask).astype(bool)
+
+    def quantile_loss(y, q_pred, tau):
+        e = y - q_pred
+        return np.mean(np.maximum(tau * e, (tau - 1) * e))
+
+    def approx_crps_from_quantiles(y, p):
+        taus = [0.05, 0.25, 0.75, 0.95]
+        q_preds = [p[:, 0], p[:, 1], p[:, 2], p[:, 3]]
+        losses = [quantile_loss(y, q, tau) for q, tau in zip(q_preds, taus)]
+        return np.mean(losses)
 
     def _eval_subset(name, mask):
         y_s = y_true[mask]
@@ -159,6 +242,7 @@ def evaluate_from_predictions(y_true, y_pred, rain_mask):
                 "Cov_50": np.nan,
                 "Width_50": np.nan,
                 "Winkler_50": np.nan,
+                "CRPS_approx": np.nan,
             }
 
         q05 = p_s[:, 0]
@@ -168,6 +252,7 @@ def evaluate_from_predictions(y_true, y_pred, rain_mask):
 
         cov_90, width_90, winkler_90 = interval_metrics(y_s, q05, q95, alpha=0.1)
         cov_50, width_50, winkler_50 = interval_metrics(y_s, q25, q75, alpha=0.5)
+        crps_approx = approx_crps_from_quantiles(y_s, p_s)
 
         return {
             "Subset": name,
@@ -178,15 +263,21 @@ def evaluate_from_predictions(y_true, y_pred, rain_mask):
             "Cov_50": cov_50,
             "Width_50": width_50,
             "Winkler_50": winkler_50,
+            "CRPS_approx": crps_approx,
         }
 
     rows = [
         _eval_subset("all", np.ones(len(y_true), dtype=bool)),
-        _eval_subset("rain", rain_mask),
-        _eval_subset("non_rain", ~rain_mask),
     ]
 
+    if rain_mask is not None:
+        rows.extend([
+            _eval_subset("rain", rain_mask),
+            _eval_subset("non_rain", ~rain_mask),
+        ])
+
     return pd.DataFrame(rows)
+
 
 # ==========================================
 # 5. Model
@@ -209,6 +300,37 @@ def build_model(input_shape):
         metrics=[multi_quantile_loss]
     )
     return model
+
+# from tensorflow.keras import layers, models, optimizers
+# from tcn import TCN
+
+# def build_model(input_shape):
+#     inp = layers.Input(shape=input_shape)
+
+#     x = TCN(
+#         nb_filters=64,
+#         kernel_size=3,
+#         dilations=(1, 2, 4, 8),
+#         nb_stacks=1,
+#         padding="causal",
+#         use_skip_connections=True,
+#         dropout_rate=0.2,
+#         return_sequences=False,
+#         activation="relu",
+#         name="tcn"
+#     )(inp)
+
+#     x = layers.Dense(64, activation="relu")(x)
+#     x = layers.Dropout(0.2)(x)
+#     out = layers.Dense(4, name="quantiles")(x)
+
+#     model = models.Model(inputs=inp, outputs=out)
+#     model.compile(
+#         optimizer=optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
+#         loss=multi_quantile_loss,
+#         metrics=[multi_quantile_loss]
+#     )
+#     return model
 
 # ==========================================
 # 6. Training Runner
@@ -322,10 +444,13 @@ def apply_rain_intensity_residual_correction(
     y_pred_adj = np.asarray(y_pred).copy()
 
     # 用高分位數把 rain_intensity 壓到大概 0~1
+    # 為什麼要壓？因為我們不希望雨勢強度的絕對值影響修正強度，而是希望它在 0~1 的相對位置決定修正強度
+    # 這樣不會有leakage? 需要改training set; 不然有可能distribution leakage.
     if intensity_p90 is None:
         positive = rain_intensity[rain_intensity > 0]
         intensity_p90 = np.quantile(positive, 0.9) if len(positive) > 0 else 1.0
 
+    # 到0.0~1.1.0的比例尺，雨越大越接近1，雨越小越接近0
     intensity_scale = np.clip(rain_intensity / max(intensity_p90, 1e-6), 0.0, 1.0)
 
     for i in range(len(y_pred_adj)):
@@ -334,25 +459,29 @@ def apply_rain_intensity_residual_correction(
 
         if rain_mask[i]:
             # 1) 立即修正：雨越大，下修越多
-            instant_adjust = instant_base + instant_gain * s
+            instant_adjust = instant_base + instant_gain * s # instant_gain = 第一步修正
             total_adjust += instant_adjust
 
-            # 2) 剛進入雨天第一點：雨越大，多修更多
-            if i > 0 and (not rain_mask[i - 1]):
+            # 2) 剛進入雨天第一點：雨越大，多修更多; 
+            if i > 0 and (not rain_mask[i - 1]): # first_gain = 第二步修正，第一次修正多
                 first_adjust = first_base + first_gain * s
                 total_adjust += first_adjust
 
         # 3) 連續雨天：上一期高估時，再根據當前/前一期雨勢放大修正
         if i > 0 and rain_mask[i - 1] and rain_mask[i]:
+            # 75 ~ 25 算中心點
             prev_center = (y_pred_adj[i - 1, 1] + y_pred_adj[i - 1, 2]) / 2.0
             actual_prev = y_true[i - 1]
-
+            # 算出超出了多少？超出比例越大，修正越多
             over_ratio = max(prev_center - actual_prev, 0.0) / max(abs(prev_center), 1e-6)
 
             s_prev = intensity_scale[i - 1]
             s_pair = max(s, s_prev)   # 或者用 (s + s_prev)/2
+            # 只要這兩個相鄰時刻中有一個雨勢很強，就把這段視為強雨情境。
 
-            beta_eff = beta_base + beta_rain_gain * s_pair
+            beta_eff = beta_base + beta_rain_gain * s_pair # beta_rain_gain = 第三步修正，雨越大，residual correction越強
+            # # 基本 residual correction 強度 beta_base + 雨勢放大後的額外強度 beta_rain_gain * s_pair
+            # beta_rain_gain  雨越大，beta 再往上加多少
             dynamic_adjust = min(beta_eff * over_ratio, max_adjust)
             total_adjust += dynamic_adjust
 
