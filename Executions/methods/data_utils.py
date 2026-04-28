@@ -30,8 +30,8 @@ def load_data():
     weather_h.columns = ["temp_mean", "windspeed_mean", "rain_sum"]
     
     df = traffic_h.join(weather_h, how="left")
-    df["temp_mean"] = df["temp_mean"].ffill().bfill()
-    df["windspeed_mean"] = df["windspeed_mean"].ffill().bfill()
+    df["temp_mean"] = df["temp_mean"].ffill()#.bfill()
+    df["windspeed_mean"] = df["windspeed_mean"].ffill()#.bfill()
     df["rain_sum"] = df["rain_sum"].fillna(0.0)
     
     # 會生成 download_q95, download_q05, download_mean, download_std, upload_mean, temp_mean, windspeed_mean, rain_sum
@@ -97,32 +97,69 @@ def feature_engineering(df):
 
     # ===== 下一時間點 one-hot =====
     for c in hour_cols:
-        df[f"{c}_next"] = df[c].shift(-1)
+        df[f"{c}"] = df[c]
     for c in dow_cols:
-        df[f"{c}_next"] = df[c].shift(-1)
+        df[f"{c}"] = df[c]
 
     # ===== Weather features =====
-    df["temp_next"] = df["temp_mean"].shift(-1).ffill().bfill()
-    df["wind_next"] = df["windspeed_mean"].shift(-1).ffill().bfill()
-    df["rain_next"] = df["rain_sum"].shift(-1).fillna(0.0)
+    # df["temp_next"] = df["temp_mean"].ffill() #.shift(-1).ffill()#.bfill()
+    # df["wind_next"] = df["windspeed_mean"].ffill()#.bfill().   .shift(-1).ffill()
+    df["rain"] = df["rain_sum"].ffill().fillna(0.0)
 
-    df["temp_d1"] = df["temp_next"] - df["temp_mean"]
-    df["wind_d1"] = df["wind_next"] - df["windspeed_mean"]
+    # df["temp_d1"] = df["temp_next"] - df["temp_mean"]
+    # df["wind_d1"] = df["wind_next"] - df["windspeed_mean"]
 
-    df["rain_event"] = (df["rain_next"] > 0.0).astype("float32")
-    df["rain_intensity"] = np.log1p(df["rain_next"].clip(lower=0.0))
+    df["rain_event"] = (df["rain"] > 0.0).astype("float32")
+    df["rain_intensity"] = np.log1p(df["rain"].clip(lower=0.0))
 
     df.dropna(inplace=True)
     return df
 
+
+def inject_rain_noise_intensity_only(
+    df,
+    rain_col="rain_next",
+    intensity_col="rain_intensity",
+    noise_std_ratio=0.05,
+    min_positive=1e-6,
+    random_state=42
+):
+    """
+    只在 rain_col > 0 時加 Gaussian noise，
+    用來模擬 rainfall intensity uncertainty，
+    不改變 rain occurrence。
+    """
+    df_noisy = df.copy()
+    rng = np.random.default_rng(random_state)
+
+    rain = df_noisy[rain_col].astype(float).to_numpy()
+    rainy_mask = rain > 0.0
+
+    noisy_rain = rain.copy()
+
+    # 僅對 rainy samples 加 noise
+    std = noise_std_ratio * np.maximum(rain[rainy_mask], min_positive)
+    eps = rng.normal(loc=0.0, scale=std, size=rainy_mask.sum())
+
+    noisy_rain[rainy_mask] = rain[rainy_mask] + eps
+
+    # 為了保持 occurrence 不變，原本有雨的點至少維持為正
+    noisy_rain[rainy_mask] = np.maximum(noisy_rain[rainy_mask], min_positive)
+
+    # 更新 rain_next
+    df_noisy[rain_col] = noisy_rain
+
+    # 重新由 rain_next 計算 rain_intensity
+    df_noisy[intensity_col] = np.log1p(df_noisy[rain_col])
+
+    # 不重算 rain_event，保持原本 event 結構
+    return df_noisy
+
 def set_mode_features(df, mode: str):
-    # base = ["download_q95", "download_q05", "download_mean", "download_std", "upload_mean"]
     base = ["download_mean", "upload_mean"]
 
-    # time_feats = ["hod_sin_next", "hod_cos_next", "dow_sin_next", "dow_cos_next"]
     time_feats = [f"hod_{i}_next" for i in range(24)] + [f"dow_{i}_next" for i in range(7)]
-    # weather_feats = ["temp_next", "temp_d1", "wind_next", "wind_d1", "rain_event", "rain_intensity"]
-    # weather_feats = ["temp_next", "temp_d1", "rain_event", "rain_intensity"]
+
     weather_feats = ["rain_event", "rain_intensity"]
 
     if mode == "base":
@@ -151,7 +188,16 @@ def set_mode_features(df, mode: str):
     if missing_cols:
         print(f"[WARN] mode={mode}, missing columns skipped: {missing_cols}")
 
-    df = df[feature_cols + ["target_mean"]]
+    # 重要：
+    # feature_cols 是 model input 用的欄位。
+    # aux_cols 是不進 model，但保留下來讓 make_dataset() 產生 rain masks / intensity。
+    aux_cols = []
+    for c in ["rain_event", "rain_intensity"]:
+        if c in df.columns and c not in feature_cols:
+            aux_cols.append(c)
+
+    df = df[feature_cols + ["target_mean"] + aux_cols]
+
     return df, feature_cols
 
 # def make_dataset(df, feature_cols):
@@ -178,36 +224,277 @@ def set_mode_features(df, mode: str):
 #         np.array(t_list)
 #     )
 
+# def inject_rain_intensity_noise_after_scaling(
+#     X,
+#     feature_cols,
+#     scaler,
+#     noise_std_ratio=0.05,
+#     rain_event_col="rain_event",
+#     rain_intensity_col="rain_intensity",
+#     min_positive=1e-6,
+#     random_state=42
+# ):
+#     """
+#     對已 scaled 的 X，在 inverse_transform 後對 rain_intensity 加相對 Gaussian noise，
+#     再 transform 回 scaled space。
+#     """
+#     X_noisy = X.copy()
+#     rng = np.random.default_rng(random_state)
+
+#     F = X.shape[-1]
+#     X_2d = X.reshape(-1, F)
+
+#     # 回到原始 feature 空間
+#     X_orig = scaler.inverse_transform(X_2d)
+
+#     if rain_intensity_col not in feature_cols:
+#         raise ValueError(f"{rain_intensity_col} not found in feature_cols")
+#     ri_idx = feature_cols.index(rain_intensity_col)
+
+#     if rain_event_col not in feature_cols:
+#         raise ValueError(f"{rain_event_col} not found in feature_cols")
+#     re_idx = feature_cols.index(rain_event_col)
+
+#     rain_event = X_orig[:, re_idx]
+#     rain_intensity = X_orig[:, ri_idx]
+
+#     rainy_mask = rain_event > 0
+
+#     std = noise_std_ratio * np.maximum(np.abs(rain_intensity[rainy_mask]), min_positive)
+#     eps = rng.normal(loc=0.0, scale=std, size=rainy_mask.sum())
+
+#     X_orig[rainy_mask, ri_idx] = rain_intensity[rainy_mask] + eps
+
+#     # 再轉回 scaled space
+#     X_scaled_back = scaler.transform(X_orig).reshape(X.shape)
+
+#     return X_scaled_back
+
+
+def inject_rain_intensity_noise_after_scaling(
+    X,
+    feature_cols,
+    scaler,
+    noise_std_ratio=0.05,
+    rain_event_col="rain_event",
+    rain_intensity_col="rain_intensity",
+    min_positive=1e-6,
+    random_state=42,
+    return_correction_intensity=False,
+    correction_step=-1,
+    clip_nonnegative=True,
+):
+    """
+    對已 scaled 的 X，在 inverse_transform 後對 rain_intensity 加相對 Gaussian noise，
+    再 transform 回 scaled space。
+
+    如果 return_correction_intensity=True，額外回傳每個 sample 指定 lag step 的
+    noisy 原尺度 rain_intensity，給 correction 使用。
+
+    correction_step=-1 代表取 input window 最後一個時間點。
+    """
+    rng = np.random.default_rng(random_state)
+
+    original_shape = X.shape
+    F = X.shape[-1]
+    X_2d = X.reshape(-1, F)
+
+    # 回到原始 feature 空間
+    X_orig = scaler.inverse_transform(X_2d)
+
+    if rain_intensity_col not in feature_cols:
+        raise ValueError(f"{rain_intensity_col} not found in feature_cols")
+    ri_idx = feature_cols.index(rain_intensity_col)
+
+    if rain_event_col not in feature_cols:
+        raise ValueError(f"{rain_event_col} not found in feature_cols")
+    re_idx = feature_cols.index(rain_event_col)
+
+    rain_event = X_orig[:, re_idx]
+    rain_intensity = X_orig[:, ri_idx]
+
+    rainy_mask = rain_event > 0
+
+    std = noise_std_ratio * np.maximum(
+        np.abs(rain_intensity[rainy_mask]),
+        min_positive
+    )
+    eps = rng.normal(loc=0.0, scale=std, size=rainy_mask.sum())
+
+    X_orig[rainy_mask, ri_idx] = rain_intensity[rainy_mask] + eps
+
+    if clip_nonnegative:
+        X_orig[:, ri_idx] = np.maximum(X_orig[:, ri_idx], 0.0)
+
+    # 先保留 noisy 原尺度版本
+    X_orig_noisy_3d = X_orig.reshape(original_shape)
+
+    # 再轉回 scaled space 給 model
+    X_scaled_back = scaler.transform(X_orig).reshape(original_shape)
+
+    if return_correction_intensity:
+        rain_intensity_for_correction = X_orig_noisy_3d[:, correction_step, ri_idx]
+        return X_scaled_back, rain_intensity_for_correction
+
+    return X_scaled_back
+
+# def make_dataset(df, feature_cols):
+#     data_x = df[feature_cols].values.astype("float32")
+#     data_y = df[["target_mean"]].values.astype("float32")
+
+#     has_rain = "rain_event" in df.columns
+#     has_rain_intensity = "rain_intensity" in df.columns
+
+#     data_rain = df["rain_event"].values.astype("float32") if has_rain else None
+#     data_rain_intensity = df["rain_intensity"].values.astype("float32") if has_rain_intensity else None
+
+#     X_list, y_list, r_list, ri_list, t_list = [], [], [], [], []
+#     L = Config.LAGGED_VALUE
+#     ts = df.index
+
+#     for i in range(L, len(data_x)):
+#         time_diff = (ts[i] - ts[i - L]).total_seconds() / 60.0
+#         if time_diff <= L * Config.EXPECTED_MINUTES + 15:
+#             X_list.append(data_x[i - L:i])
+#             y_list.append(data_y[i])
+#             t_list.append(ts[i])
+
+#             if has_rain:
+#                 r_list.append(data_rain[i-1])
+#             if has_rain_intensity:
+#                 ri_list.append(data_rain_intensity[i-1])
+
+#     X = np.array(X_list)
+#     y = np.array(y_list)
+#     r = np.array(r_list) if has_rain else None
+#     ri = np.array(ri_list) if has_rain_intensity else None
+#     t = np.array(t_list)
+
+#     return X, y, r, ri, t
+
+# def make_dataset(df, feature_cols):
+#     data_x = df[feature_cols].values.astype("float32")
+#     data_y = df[["target_mean"]].values.astype("float32") # 這裡已經是 t+1
+
+#     has_rain = "rain_event" in df.columns
+#     has_rain_intensity = "rain_intensity" in df.columns
+
+#     # 注意：在 feature_engineering 中，rain_event 已經是 shift(-1)
+#     # 所以 data_rain[i] 代表的是時間點 t+1 的雨
+#     data_rain = df["rain_event"].values.astype("float32") if has_rain else None
+#     data_rain_intensity = df["rain_intensity"].values.astype("float32") if has_rain_intensity else None
+
+#     X_list, y_list, r_list, ri_list, t_list = [], [], [], [], []
+#     L = Config.LAGGED_VALUE
+#     ts = df.index
+
+#     # 修正範圍：從 L-1 開始，到 len - 1 結束
+#     # 這樣 X_list 會包含到 i，而 y_list 會取到 target_mean[i] (即 i+1 的實際值)
+#     for i in range(L - 1, len(data_x)):
+#         # 檢查時間連續性
+#         time_diff = (ts[i] - ts[i - L + 1]).total_seconds() / 60.0
+#         if time_diff <= (L - 1) * Config.EXPECTED_MINUTES: #+ 15:
+            
+#             # --- 核心修正點 ---
+#             # X 取從 i-L+1 到 i (包含第 i 筆特徵)
+#             X_list.append(data_x[i - L + 1 : i + 1]) 
+            
+#             # y 取 target_mean[i]，對應的是時間點 t+1
+#             y_list.append(data_y[i])
+            
+#             # 時間標記為當前時間點 t (發出預測的時間)
+#             t_list.append(ts[i])
+
+#             # 雨量資訊取 i，因為已 shift(-1)，所以這代表 t+1 的雨勢
+#             if has_rain:
+#                 r_list.append(data_rain[i])
+#             if has_rain_intensity:
+#                 ri_list.append(data_rain_intensity[i])
+
+#     X = np.array(X_list)
+#     y = np.array(y_list)
+#     r = np.array(r_list) if has_rain else None
+#     ri = np.array(ri_list) if has_rain_intensity else None
+#     t = np.array(t_list)
+
+#     return X, y, r, ri, t
 def make_dataset(df, feature_cols):
-    data_x = df[feature_cols].values.astype("float32")
-    data_y = df[["target_mean"]].values.astype("float32")
+    rain_cols = ["rain_event", "rain_intensity"]
+
+    # 一般特徵：排除 rain，因為 rain 要另外用 t+1 加進 X
+    x_feature_cols = [c for c in feature_cols if c not in rain_cols]
+
+    if "target_mean" in x_feature_cols:
+        raise ValueError("❌ feature_cols 不可以包含 target_mean，這會造成 leakage")
+
+    data_x = df[x_feature_cols].values.astype("float32")
+    data_y = df[["target_mean"]].values.astype("float32")  # 已經是 t+1
 
     has_rain = "rain_event" in df.columns
     has_rain_intensity = "rain_intensity" in df.columns
 
     data_rain = df["rain_event"].values.astype("float32") if has_rain else None
-    data_rain_intensity = df["rain_intensity"].values.astype("float32") if has_rain_intensity else None
+    data_rain_intensity = (
+        df["rain_intensity"].values.astype("float32")
+        if has_rain_intensity
+        else None
+    )
 
     X_list, y_list, r_list, ri_list, t_list = [], [], [], [], []
+
     L = Config.LAGGED_VALUE
     ts = df.index
 
-    for i in range(L, len(data_x)):
-        time_diff = (ts[i] - ts[i - L]).total_seconds() / 60.0
-        if time_diff <= L * Config.EXPECTED_MINUTES + 15:
-            X_list.append(data_x[i - L:i])
+    # 因為 rain 要取 i+1，所以最後只能跑到 len(data_x)-2
+    for i in range(L - 1, len(data_x) - 1):
+        start_i = i - L + 1
+        next_i = i + 1
+
+        hist_time_diff = (ts[i] - ts[start_i]).total_seconds() / 60.0
+        next_time_diff = (ts[next_i] - ts[i]).total_seconds() / 60.0
+
+        if (
+            hist_time_diff <= (L - 1) * Config.EXPECTED_MINUTES
+            and next_time_diff <= Config.EXPECTED_MINUTES
+        ):
+            # 一般特徵：t-L+1 ~ t
+            X_base = data_x[start_i : i + 1]
+
+            # rain：t+1
+            rain_future = data_rain[next_i] if has_rain else 0.0
+            rain_intensity_future = (
+                data_rain_intensity[next_i]
+                if has_rain_intensity
+                else 0.0
+            )
+
+            # rain block: shape = (L, 2)
+            # 前 L-1 格補 0，最後一格放 t+1 rain
+            rain_block = np.zeros((L, 2), dtype="float32")
+            rain_block[-1, 0] = rain_future
+            rain_block[-1, 1] = rain_intensity_future
+
+            # X 最後兩欄是 future rain
+            X_full = np.concatenate([X_base, rain_block], axis=1)
+
+            X_list.append(X_full)
+
+            # y: target_mean[i]，你前面已經做成 t+1
             y_list.append(data_y[i])
+
+            # t: 預測發出時間 t
             t_list.append(ts[i])
 
             if has_rain:
-                r_list.append(data_rain[i])
-            if has_rain_intensity:
-                ri_list.append(data_rain_intensity[i])
+                r_list.append(rain_future)
 
-    X = np.array(X_list)
-    y = np.array(y_list)
-    r = np.array(r_list) if has_rain else None
-    ri = np.array(ri_list) if has_rain_intensity else None
+            if has_rain_intensity:
+                ri_list.append(rain_intensity_future)
+
+    X = np.array(X_list, dtype="float32")
+    y = np.array(y_list, dtype="float32")
+    r = np.array(r_list, dtype="float32") if has_rain else None
+    ri = np.array(ri_list, dtype="float32") if has_rain_intensity else None
     t = np.array(t_list)
 
     return X, y, r, ri, t
