@@ -158,7 +158,8 @@ def inject_rain_noise_intensity_only(
 def set_mode_features(df, mode: str):
     base = ["download_mean", "upload_mean"]
 
-    time_feats = [f"hod_{i}_next" for i in range(24)] + [f"dow_{i}_next" for i in range(7)]
+    # 改這行：用 feature_engineering 已經產生的 current time one-hot
+    time_feats = [f"hod_{i}" for i in range(24)] + [f"dow_{i}" for i in range(7)]
 
     weather_feats = ["rain_event", "rain_intensity"]
 
@@ -174,23 +175,11 @@ def set_mode_features(df, mode: str):
         raise ValueError(f"Unknown mode: {mode}")
 
     missing_cols = [c for c in feats if c not in df.columns]
-    feature_cols = [c for c in feats if c in df.columns]
-
-    if "target_mean" not in df.columns:
-        raise KeyError("'target_mean' not in df.columns")
-
-    if len(feature_cols) == 0:
-        raise ValueError(
-            f"No usable features found for mode={mode}. "
-            f"Expected one of: {feats}"
-        )
-
     if missing_cols:
-        print(f"[WARN] mode={mode}, missing columns skipped: {missing_cols}")
+        raise KeyError(f"mode={mode} missing required columns: {missing_cols}")
 
-    # 重要：
-    # feature_cols 是 model input 用的欄位。
-    # aux_cols 是不進 model，但保留下來讓 make_dataset() 產生 rain masks / intensity。
+    feature_cols = feats
+
     aux_cols = []
     for c in ["rain_event", "rain_intensity"]:
         if c in df.columns and c not in feature_cols:

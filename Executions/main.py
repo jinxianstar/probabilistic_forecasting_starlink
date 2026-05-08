@@ -145,7 +145,7 @@ if __name__ == "__main__":
     add_noise_to_rain_intensity = False
     noise_std_ratio = 0.2
     plot_start = 0
-    plot_end = 1000
+    plot_end = 82
     # Case I.
     case_i_str = ""
     for i in range (1):

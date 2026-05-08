@@ -550,6 +550,181 @@ def evaluate_quantiles(model, X, y_true):
 
     return result
 
+
+
+
+
+def plot_prediction_to_pdf(
+    y_true,
+    y_pred,
+    timestamps=None,
+    rain_mask=None,
+    title="Model Prediction Analysis",
+    start=0,
+    end=100,
+    save_dir=".",
+    x_axis="time",
+    fig_width=10,
+    fig_height=6
+):
+    import os
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from datetime import datetime
+
+    # --- 1. 資料處理 ---
+    y_true_plot = np.asarray(y_true).reshape(-1)[start:end]
+    y_pred_plot = np.asarray(y_pred)[start:end]
+
+    if x_axis == "time" and timestamps is not None:
+        x = pd.to_datetime(timestamps)[start:end]
+        use_datetime = True
+    else:
+        x = np.arange(len(y_true_plot))
+        use_datetime = False
+
+    if rain_mask is None:
+        rain_mask_plot = np.zeros(len(y_true_plot), dtype=bool)
+    else:
+        rain_mask_plot = np.asarray(rain_mask).astype(bool)[start:end]
+
+    q05, q25, q75, q95 = (
+        y_pred_plot[:, 0],
+        y_pred_plot[:, 1],
+        y_pred_plot[:, 2],
+        y_pred_plot[:, 3],
+    )
+    median = (q25 + q75) / 2.0
+
+    # --- 2. 畫圖設定 ---
+    plt.style.use("seaborn-v0_8-whitegrid")
+
+    plt.rcParams.update({
+        "font.size": 13,
+        "axes.titlesize": 20,
+        "axes.labelsize": 15,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 12,
+        "legend.fontsize": 11
+    })
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    # --- 3. 雨天區塊：合併連續區段 ---
+    if len(rain_mask_plot) > 0 and np.any(rain_mask_plot):
+        rain_idx = np.where(rain_mask_plot)[0]
+        split_points = np.where(np.diff(rain_idx) > 1)[0] + 1
+        rain_groups = np.split(rain_idx, split_points)
+
+        first_label = True
+        for group in rain_groups:
+            i_start = group[0]
+            i_end = group[-1]
+
+            if use_datetime:
+                left = x[i_start] - pd.Timedelta(minutes=30)
+                right = x[i_end] + pd.Timedelta(minutes=30)
+            else:
+                left = x[i_start] - 0.5
+                right = x[i_end] + 0.5
+
+            ax.axvspan(
+                left, right,
+                color="#bcdff1",
+                alpha=0.30,
+                zorder=0,
+                label="Rainy Period" if first_label else None
+            )
+            first_label = False
+
+    # --- 4. 預測區間：同色系，不完全分開 ---
+    ax.fill_between(
+        x, q05, q95,
+        color="#4C78A8",
+        alpha=0.20,
+        label="90% Prediction Interval",
+        zorder=1
+    )
+
+    ax.fill_between(
+        x, q25, q75,
+        color="#4C78A8",
+        alpha=0.42,
+        label="50% Prediction Interval",
+        zorder=2
+    )
+
+    # # 中位數線
+    # ax.plot(
+    #     x, median,
+    #     linestyle="--",
+    #     linewidth=2.2,
+    #     color="#174A7E",
+    #     alpha=0.95,
+    #     label="Prediction Median",
+    #     zorder=3
+    # )
+
+    # 真值
+    ax.scatter(
+        x, y_true_plot,
+        s=70,
+        c="#E4572E",
+        edgecolors="white",
+        linewidths=1.0,
+        label="True Value",
+        zorder=4
+    )
+
+    # --- 5. 美化 ---
+    ax.set_title(title, fontweight="bold", pad=16)
+    ax.set_xlabel("Time" if use_datetime else "Index")
+    ax.set_ylabel("Value")
+
+    if use_datetime:
+        plt.xticks(rotation=30, ha="right")
+
+    y_min = np.nanmin([np.nanmin(q05), np.nanmin(y_true_plot)])
+    y_max = np.nanmax([np.nanmax(q95), np.nanmax(y_true_plot)])
+    y_range = y_max - y_min
+    y_pad = y_range * 0.08 if y_range > 0 else 1.0
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+    ax.margins(x=0.02)
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    # legend 放在圖內，但用半透明白底避免擋住太多
+    legend = ax.legend(
+        loc="upper left",
+        frameon=True,
+        fancybox=True,
+        framealpha=0.82,
+        borderpad=0.8
+    )
+
+    legend.get_frame().set_facecolor("white")
+    legend.get_frame().set_edgecolor("#dddddd")
+
+    plt.tight_layout()
+
+    # --- 6. 儲存為 PDF ---
+    os.makedirs(save_dir, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fig_path = os.path.join(save_dir, f"forecast_{ts}.pdf")
+
+    plt.savefig(fig_path, format="pdf", bbox_inches="tight")
+    print(f"檔案已儲存至: {fig_path}")
+
+    plt.show()
+    plt.close()
+
+    return fig_path
+
+
 # def evaluate_from_predictions(y_true, y_pred, rain_mask=None):
 #     y_true = np.asarray(y_true).reshape(-1)
 #     y_pred = np.asarray(y_pred)
