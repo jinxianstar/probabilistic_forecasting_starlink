@@ -164,9 +164,9 @@ def correction_objective(eval_df):
 #     return loss
 
 
-def tune_rain_correction_on_validation(models, y_va, y_pred_va, masks_va, mode="normal", intensity_p90=None):
+def tune_rain_correction_on_validation(models, y_va, y_pred_va, masks_va, mode="normal", intensity_p90=None, gate=False):
     if mode == "normal":
-        return tune_rain_correction_on_validation_normal(models, y_va, y_pred_va, masks_va, intensity_p90=intensity_p90)
+        return tune_rain_correction_on_validation_normal(models, y_va, y_pred_va, masks_va, intensity_p90=intensity_p90, gate=gate)
     elif mode == "de":
         return tune_rain_correction_on_validation_de(models, y_va, y_pred_va, masks_va, intensity_p90=intensity_p90)
     elif mode == "multistart":
@@ -176,7 +176,7 @@ def tune_rain_correction_on_validation(models, y_va, y_pred_va, masks_va, mode="
         raise ValueError(f"Unknown tuning mode: {mode}")
 
 
-def tune_rain_correction_on_validation_normal(models, y_va, y_pred_va, masks_va, intensity_p90=None):
+def tune_rain_correction_on_validation_normal(models, y_va, y_pred_va, masks_va, intensity_p90=None, gate=False):
     param_grid = {
         "beta_base":      [0.20, 0.35, 0.50, 0.65],
         "beta_rain_gain": [0.40, 0.60, 0.80, 1.00],
@@ -186,38 +186,212 @@ def tune_rain_correction_on_validation_normal(models, y_va, y_pred_va, masks_va,
         "first_gain":     [0.03, 0.05, 0.08, 0.10],
         "max_adjust":     [0.20, 0.30, 0.40, 0.50],
     }
-
-    keys = list(param_grid.keys())
-    best_loss = np.inf
-    best_params = None
-    best_eval = None
-
-    for values in itertools.product(*[param_grid[k] for k in keys]):
-        params = dict(zip(keys, values))
-
-        y_pred_adj_va = corrections.apply_rain_intensity_residual_correction(
-            y_pred=y_pred_va,
+    if gate == True:
+        keys = list(param_grid.keys())
+    
+        # [修改 1] 先評估「未經任何校準 (Baseline)」的原始預測結果
+        eval_va_baseline = models.evaluate_from_predictions(
             y_true=y_va,
-            rain_mask=masks_va["rain"],
-            rain_intensity=masks_va["rain_intensity"],
-            intensity_p90=intensity_p90,
-            **params
-        )
-
-        eval_va = models.evaluate_from_predictions(
-            y_true=y_va,
-            y_pred=y_pred_adj_va,
+            y_pred=y_pred_va, # 使用原始預測 y_pred_va
             rain_mask=masks_va["rain"]
         )
+        
+        # [修改 2] 計算 Baseline 的 Loss 作為基準防線
+        baseline_loss = correction_objective(eval_va_baseline)
 
-        loss = correction_objective(eval_va)
+        # [修改 3] 初始化為 Baseline 的數值，而非 np.inf
+        best_loss = baseline_loss
+        
+        # [修改 4] 預設回傳的參數為全 0 (代表無校準作用)。
+        # 確保 DIRC 中的 beta0, beta1, alpha0, alpha1 若為 0，等同於原始預測
+        best_params = {k: 0.0 for k in keys} 
+        best_eval = eval_va_baseline.copy()
 
-        if loss < best_loss:
-            best_loss = loss
-            best_params = params
-            best_eval = eval_va.copy()
+        for values in itertools.product(*[param_grid[k] for k in keys]):
+            params = dict(zip(keys, values))
 
-    return best_params, best_loss, best_eval
+            y_pred_adj_va = corrections.apply_rain_intensity_residual_correction(
+                y_pred=y_pred_va,
+                y_true=y_va,
+                rain_mask=masks_va["rain"],
+                rain_intensity=masks_va["rain_intensity"],
+                intensity_p90=intensity_p90,
+                **params
+            )
+
+            eval_va = models.evaluate_from_predictions(
+                y_true=y_va,
+                y_pred=y_pred_adj_va,
+                rain_mask=masks_va["rain"]
+            )
+
+            loss = correction_objective(eval_va)
+
+            # [修改 5] 只有當新參數的 loss 「嚴格小於」 best_loss 時才更新
+            # 如果站點 B 根本沒有雨衰，加上任何參數都會讓 loss 變大，這裡就不會觸發
+            if loss < best_loss:
+                best_loss = loss
+                best_params = params
+                best_eval = eval_va.copy()
+
+        return best_params, best_loss, best_eval
+    else:
+        keys = list(param_grid.keys())
+        best_loss = np.inf
+        best_params = None
+        best_eval = None
+
+        for values in itertools.product(*[param_grid[k] for k in keys]):
+            params = dict(zip(keys, values))
+
+            y_pred_adj_va = corrections.apply_rain_intensity_residual_correction(
+                y_pred=y_pred_va,
+                y_true=y_va,
+                rain_mask=masks_va["rain"],
+                rain_intensity=masks_va["rain_intensity"],
+                intensity_p90=intensity_p90,
+                **params
+            )
+
+            eval_va = models.evaluate_from_predictions(
+                y_true=y_va,
+                y_pred=y_pred_adj_va,
+                rain_mask=masks_va["rain"]
+            )
+
+            loss = correction_objective(eval_va)
+
+            if loss < best_loss:
+                best_loss = loss
+                best_params = params
+                best_eval = eval_va.copy()
+
+        return best_params, best_loss, best_eval
+
+
+# def tune_rain_correction_on_validation_normal(
+#     models,
+#     y_va,
+#     y_pred_va,
+#     masks_va,
+#     intensity_p90=None,
+#     min_rel_improvement=0.02,  # 至少改善 1%
+# ):
+#     identity_params = {
+#         "beta_base": 0.00,
+#         "beta_rain_gain": 0.00,
+#         "instant_base": 0.00,
+#         "instant_gain": 0.00,
+#         "first_base": 0.00,
+#         "first_gain": 0.00,
+#         "max_adjust": 0.00,
+#     }
+
+#     param_grid = {
+#         "beta_base":      [0.00, 0.20, 0.35, 0.50, 0.65],
+#         "beta_rain_gain": [0.00, 0.40, 0.60, 0.80, 1.00],
+#         "instant_base":   [0.00, 0.02, 0.05, 0.08, 0.10],
+#         "instant_gain":   [0.00, 0.03, 0.05, 0.08, 0.10],
+#         "first_base":     [0.00, 0.02, 0.05, 0.08, 0.10],
+#         "first_gain":     [0.00, 0.03, 0.05, 0.08, 0.10],
+#         "max_adjust":     [0.20, 0.30, 0.40, 0.50],
+#     }
+
+#     # 先評估 identity/no-correction
+#     identity_pred = corrections.apply_rain_intensity_residual_correction(
+#         y_pred=y_pred_va,
+#         y_true=y_va,
+#         rain_mask=masks_va["rain"],
+#         rain_intensity=masks_va["rain_intensity"],
+#         intensity_p90=intensity_p90,
+#         **identity_params
+#     )
+
+#     identity_eval = models.evaluate_from_predictions(
+#         y_true=y_va,
+#         y_pred=identity_pred,
+#         rain_mask=masks_va["rain"]
+#     )
+
+#     identity_loss = correction_objective(identity_eval)
+
+#     keys = list(param_grid.keys())
+#     best_dirc_loss = np.inf
+#     best_dirc_params = None
+#     best_dirc_eval = None
+
+#     for values in itertools.product(
+#         *[param_grid[k] for k in keys]
+#     ):
+#         params = dict(zip(keys, values))
+
+#         # 避免重複評估實際上等同 identity 的全零校正
+#         correction_terms = [
+#             params["beta_base"],
+#             params["beta_rain_gain"],
+#             params["instant_base"],
+#             params["instant_gain"],
+#             params["first_base"],
+#             params["first_gain"],
+#         ]
+
+#         if all(value == 0.0 for value in correction_terms):
+#             continue
+
+#         y_pred_adj_va = (
+#             corrections.apply_rain_intensity_residual_correction(
+#                 y_pred=y_pred_va,
+#                 y_true=y_va,
+#                 rain_mask=masks_va["rain"],
+#                 rain_intensity=masks_va["rain_intensity"],
+#                 intensity_p90=intensity_p90,
+#                 **params
+#             )
+#         )
+
+#         eval_va = models.evaluate_from_predictions(
+#             y_true=y_va,
+#             y_pred=y_pred_adj_va,
+#             rain_mask=masks_va["rain"]
+#         )
+
+#         loss = correction_objective(eval_va)
+
+#         if loss < best_dirc_loss:
+#             best_dirc_loss = loss
+#             best_dirc_params = params
+#             best_dirc_eval = eval_va.copy()
+
+#     relative_improvement = (
+#         identity_loss - best_dirc_loss
+#     ) / max(abs(identity_loss), 1e-12)
+
+#     if relative_improvement >= min_rel_improvement:
+#         best_loss = best_dirc_loss
+#         best_params = best_dirc_params
+#         best_eval = best_dirc_eval
+#         correction_enabled = True
+#     else:
+#         best_loss = identity_loss
+#         best_params = identity_params
+#         best_eval = identity_eval.copy()
+#         correction_enabled = False
+
+#     # return {
+#     #     "best_loss": best_loss,
+#     #     "best_params": best_params,
+#     #     "best_eval": best_eval,
+#     #     "identity_loss": identity_loss,
+#     #     "best_dirc_loss": best_dirc_loss,
+#     #     "relative_improvement": relative_improvement,
+#     #     "correction_enabled": correction_enabled,
+#     # }
+#     print(f"Identity validation loss: {identity_loss:.6f}")
+#     print(f"Best non-identity DIRC loss: {best_dirc_loss:.6f}")
+#     print(f"Relative improvement: {relative_improvement * 100:.4f}%")
+#     print(f"DIRC enabled: {correction_enabled}")
+
+#     return best_params, best_loss, best_eval
 
 def tune_rain_correction_on_validation_de(models, y_va, y_pred_va, masks_va, intensity_p90=None):
     keys = [

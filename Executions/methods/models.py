@@ -673,14 +673,14 @@ def plot_prediction_to_pdf(
         c="#E4572E",
         edgecolors="white",
         linewidths=1.0,
-        label="True Value",
+        label="True",
         zorder=4
     )
 
     # --- 5. 美化 ---
     ax.set_title(title, fontweight="bold", pad=16)
     ax.set_xlabel("Time" if use_datetime else "Index")
-    ax.set_ylabel("Value")
+    ax.set_ylabel("Mbps")
 
     if use_datetime:
         plt.xticks(rotation=30, ha="right")
@@ -850,7 +850,7 @@ def evaluate_from_predictions(y_true, y_pred, rain_mask=None):
 # ==========================================
 # 5. Model
 # ==========================================
-def build_model(input_shape):
+def build_model_cnn_lstm(input_shape):
     inp = layers.Input(shape=input_shape)
     x = layers.Conv1D(64, 3, padding="causal", activation="relu")(inp)
     x = layers.Dropout(0.2)(x)
@@ -869,51 +869,119 @@ def build_model(input_shape):
     )
     return model
 
-# from tensorflow.keras import layers, models, optimizers
-# from tcn import TCN
 
+def build_model_lstm(input_shape):
+    inp = layers.Input(shape=input_shape)
+
+    x = layers.LSTM(64, return_sequences=False)(inp)
+    x = layers.Dropout(0.2)(x)
+
+    x = layers.Dense(64, activation="relu")(x)
+    out = layers.Dense(4, name="quantiles")(x)
+
+    model = models.Model(inputs=inp, outputs=out)
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
+        loss=multi_quantile_loss,
+        metrics=[multi_quantile_loss]
+    )
+    return model
 # def build_model(input_shape):
 #     inp = layers.Input(shape=input_shape)
 
-#     x = TCN(
-#         nb_filters=64,
-#         kernel_size=3,
-#         dilations=(1, 2, 4, 8),
-#         nb_stacks=1,
-#         padding="causal",
-#         use_skip_connections=True,
-#         dropout_rate=0.2,
-#         return_sequences=False,
-#         activation="relu",
-#         name="tcn"
-#     )(inp)
+#     x = layers.Conv1D(64, 3, padding="causal", activation="relu")(inp)
+#     x = layers.Dropout(0.2)(x)
+
+#     x = layers.LSTM(64, return_sequences=False)(x)
+#     x = layers.Dropout(0.2)(x)
 
 #     x = layers.Dense(64, activation="relu")(x)
-#     x = layers.Dropout(0.2)(x)
 #     out = layers.Dense(4, name="quantiles")(x)
 
 #     model = models.Model(inputs=inp, outputs=out)
+
 #     model.compile(
 #         optimizer=optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
 #         loss=multi_quantile_loss,
-#         metrics=[multi_quantile_loss]
+#         metrics=[],
+#         weighted_metrics=[]
 #     )
+
 #     return model
+
+from tensorflow.keras import layers, models, optimizers
+from tcn import TCN
+
+def build_model_tcn(input_shape):
+    inp = layers.Input(shape=input_shape)
+
+    x = TCN(
+        nb_filters=64,
+        kernel_size=3,
+        dilations=(1, 2, 4, 8),
+        nb_stacks=1,
+        padding="causal",
+        use_skip_connections=True,
+        dropout_rate=0.2,
+        return_sequences=False,
+        activation="relu",
+        name="tcn"
+    )(inp)
+
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(0.2)(x)
+    out = layers.Dense(4, name="quantiles")(x)
+
+    model = models.Model(inputs=inp, outputs=out)
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=0.001, clipnorm=1.0),
+        loss=multi_quantile_loss,
+        metrics=[multi_quantile_loss]
+    )
+    return model
 
 # ==========================================
 # 6. Training Runner
 # ==========================================
-def train(X_train, y_train, sample_weights, X_validation, y_validation):
-    model = build_model((X_train.shape[1], X_train.shape[2]))
+# def train(X_train, y_train, sample_weights, X_validation, y_validation):
+#     model = build_model((X_train.shape[1], X_train.shape[2]))
 
+#     model.fit(
+#         X_train,
+#         y_train,
+#         sample_weight=sample_weights,
+#         validation_data=(X_validation, y_validation),
+#         epochs=Config.EPOCHS,
+#         batch_size=Config.BATCH_SIZE,
+#         callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+#         verbose=1
+#     )
+#     return model
+
+def train(X_train, y_train, sample_weights,
+          X_validation, y_validation, val_sample_weights):
+    if Config.MODEL_TYPE == "TCN":
+        model = build_model_tcn((X_train.shape[1], X_train.shape[2]))
+    elif Config.MODEL_TYPE == "CNNLSTM":
+        model = build_model_cnn_lstm((X_train.shape[1], X_train.shape[2]))
+    elif Config.MODEL_TYPE == "LSTM":
+        model = build_model_lstm((X_train.shape[1], X_train.shape[2]))
+    else:
+        raise ValueError(f"Unsupported MODEL_TYPE: {Config.MODEL_TYPE}")
     model.fit(
         X_train,
         y_train,
         sample_weight=sample_weights,
-        validation_data=(X_validation, y_validation),
+        validation_data=(X_validation, y_validation, val_sample_weights),
         epochs=Config.EPOCHS,
         batch_size=Config.BATCH_SIZE,
-        callbacks=[EarlyStopping(patience=10, restore_best_weights=True)],
+        callbacks=[
+            EarlyStopping(
+                monitor="val_loss",
+                patience=10,
+                restore_best_weights=True
+            )
+        ],
         verbose=1
     )
     return model

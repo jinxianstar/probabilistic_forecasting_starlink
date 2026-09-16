@@ -224,6 +224,7 @@ def apply_rain_intensity_residual_correction(
     rain_intensity = np.asarray(rain_intensity).reshape(-1)
     y_pred_adj = np.asarray(y_pred, dtype=float).copy()
 
+    # 正規化
     if intensity_p90 is None:
         positive = rain_intensity[rain_intensity > 0]
         intensity_p90 = np.quantile(positive, 0.9) if len(positive) > 0 else 1.0
@@ -235,10 +236,11 @@ def apply_rain_intensity_residual_correction(
     ema_alpha = 0.3  # How much to trust the newest error (0.3 = 30%)
 
     for i in range(len(y_pred_adj)):
+        # 如果不下雨，重置 smoothed_error_ratio，並跳過修正
         if not rain_mask[i]:
             smoothed_error_ratio = 0.0 # Reset when it stops raining
             continue
-
+        # 根據當前雨勢強度計算基本修正，並逐步疊加其他修正
         s = intensity_scale[i]
         total_adjust = 0.0
 
@@ -288,7 +290,142 @@ def apply_rain_intensity_residual_correction(
         y_pred_adj[i, 2] = new_center + (original_width / 2.0)
 
     return y_pred_adj
-    
+
+
+def apply_rain_intensity_residual_correction(
+    y_pred,               # Shape (N, 4) -> [q05, q25, q75, q95]
+    y_true,
+    rain_mask,
+    rain_intensity,
+    beta_base=0.10,
+    beta_rain_gain=0.15,
+    instant_base=0.00,
+    instant_gain=0.05,
+    first_base=0.02,
+    first_gain=0.05,
+    max_adjust=0.15,
+    intensity_p90=None
+):
+    y_true = np.asarray(y_true).reshape(-1)
+    rain_mask = np.asarray(rain_mask).astype(bool).reshape(-1)
+    rain_intensity = np.asarray(rain_intensity).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    # 模型應輸出：[q05, q25, q75, q95]
+    if y_pred.ndim != 2 or y_pred.shape[1] != 4:
+        raise ValueError(
+            f"y_pred must have shape (N, 4) as "
+            f"[q05, q25, q75, q95], but got {y_pred.shape}"
+        )
+
+    n_samples = len(y_pred)
+
+    if not (
+        len(y_true) == n_samples
+        and len(rain_mask) == n_samples
+        and len(rain_intensity) == n_samples
+    ):
+        raise ValueError(
+            "y_pred, y_true, rain_mask, and rain_intensity "
+            "must contain the same number of samples."
+        )
+
+    y_pred_adj = y_pred.copy()
+
+    # Rain-intensity normalization
+    if intensity_p90 is None:
+        positive = rain_intensity[rain_intensity > 0]
+
+        if len(positive) > 0:
+            intensity_p90 = np.quantile(positive, 0.9)
+        else:
+            intensity_p90 = 1.0
+
+    intensity_scale = np.clip(
+        rain_intensity / max(float(intensity_p90), 1e-6),
+        0.0,
+        1.0
+    )
+
+    # EMA of the previous residual ratio
+    smoothed_error_ratio = 0.0
+    ema_alpha = 0.3
+
+    for i in range(n_samples):
+
+        # No correction outside rainy periods
+        if not rain_mask[i]:
+            smoothed_error_ratio = 0.0
+            continue
+
+        s = intensity_scale[i]
+        total_adjust = 0.0
+
+        # 1. Instantaneous rain-intensity adjustment
+        total_adjust += instant_base + instant_gain * s
+
+        # 2. First-rain adjustment
+        if i > 0 and not rain_mask[i - 1]:
+            total_adjust += first_base + first_gain * s
+
+        # 3. Previous-step residual adjustment
+        if i > 0 and rain_mask[i - 1]:
+
+            # Correct center of [q25, q75]
+            prev_center = (
+                y_pred[i - 1, 1] + y_pred[i - 1, 2]
+            ) / 2.0
+
+            actual_prev = y_true[i - 1]
+
+            raw_diff = prev_center - actual_prev
+            raw_error_ratio = (
+                raw_diff / max(abs(prev_center), 1e-6)
+            )
+
+            smoothed_error_ratio = (
+                (1.0 - ema_alpha) * smoothed_error_ratio
+                + ema_alpha * raw_error_ratio
+            )
+
+            s_prev = intensity_scale[i - 1]
+            s_pair = max(s, s_prev)
+
+            beta_eff = beta_base + beta_rain_gain * s_pair
+
+            dynamic_adjust = np.clip(
+                beta_eff * smoothed_error_ratio,
+                -max_adjust,
+                max_adjust
+            )
+
+            total_adjust += dynamic_adjust
+
+        # Positive adjustment shifts predictions downward;
+        # negative adjustment shifts predictions upward.
+        total_adjust = np.clip(
+            total_adjust,
+            -max_adjust,
+            max_adjust
+        )
+
+        final_multiplier = 1.0 - total_adjust
+
+        # Current center calculated from q25 and q75
+        q25 = y_pred[i, 1]
+        q75 = y_pred[i, 2]
+
+        center_orig = (q25 + q75) / 2.0
+        new_center = center_orig * final_multiplier
+
+        # Absolute center displacement
+        delta = new_center - center_orig
+
+        # Apply identical displacement to all four quantiles.
+        # This preserves both Width50 and Width90.
+        y_pred_adj[i, :] = y_pred[i, :] + delta
+
+    return y_pred_adj
 
 
 def correction_strength(

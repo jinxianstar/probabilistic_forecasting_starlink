@@ -38,117 +38,95 @@ def compute_train_rain_intensity_p90(
 import numpy as np
 
 def audit_make_dataset_v2(df, feature_cols, X, y, r, ri, t, n_check=10):
-    rain_cols = ["rain_event", "rain_intensity"]
-    x_feature_cols = [c for c in feature_cols if c not in rain_cols]
-
-    if "target_mean" in x_feature_cols:
-        raise ValueError("❌ feature_cols 不可以包含 target_mean")
-
-    L = Config.LAGGED_VALUE
-    ts = df.index
-
-    data_x = df[x_feature_cols].values.astype("float32")
-    data_y = df[["target_mean"]].values.astype("float32")
-
-    print("X shape:", X.shape)
-    print("y shape:", y.shape)
-    print("base X feature cols:", x_feature_cols)
-    print("X 最後兩欄應該是: rain_event[t+1], rain_intensity[t+1]")
-    print("=" * 60)
-
-    expected_n_features = len(x_feature_cols) + 2
-
-    if X.shape[-1] != expected_n_features:
-        print("❌ X feature 數量錯")
-        print("X.shape[-1]:", X.shape[-1])
-        print("expected:", expected_n_features)
-        print("len(x_feature_cols):", len(x_feature_cols))
-        print("+ 2 rain future cols")
+    """Check rain-free model inputs and separately aligned DIRC rain data."""
+    x_cols = [c for c in feature_cols if c not in ["rain_event", "rain_intensity"]]
+    if "target_mean" in x_cols:
+        raise ValueError("feature_cols must not contain target_mean")
+    if X.ndim != 3 or X.shape[-1] != len(x_cols):
         return False
-
     for k in range(min(n_check, len(X))):
         i = df.index.get_loc(t[k])
-        start_i = i - L + 1
-        next_i = i + 1
-
-        expected_x_base = data_x[start_i:i + 1]
-        expected_y = data_y[i]
-
-        expected_r = df["rain_event"].iloc[next_i]
-        expected_ri = df["rain_intensity"].iloc[next_i]
-
-        ok_x_base = np.allclose(X[k, :, :-2], expected_x_base)
-        ok_y = np.allclose(y[k], expected_y)
-
-        # rain 只應該放在最後一個 timestep
-        ok_r_last = np.isclose(X[k, -1, -2], expected_r)
-        ok_ri_last = np.isclose(X[k, -1, -1], expected_ri)
-
-        # 前 L-1 個 timestep 的 rain 欄位應該是 0
-        ok_rain_before_zero = np.allclose(X[k, :-1, -2:], 0.0)
-
-        # r / ri 也要跟 X 裡最後一格一致
-        ok_r_array = True if r is None else np.isclose(r[k], expected_r)
-        ok_ri_array = True if ri is None else np.isclose(ri[k], expected_ri)
-
-        if not (
-            ok_x_base
-            and ok_y
-            and ok_r_last
-            and ok_ri_last
-            and ok_rain_before_zero
-            and ok_r_array
-            and ok_ri_array
-        ):
-            print(f"❌ sample {k} failed")
-            print("t:", ts[i])
-            print("X base time:", ts[start_i], "~", ts[i])
-            print("rain time:", ts[next_i])
-            print("ok_x_base:", ok_x_base)
-            print("ok_y:", ok_y)
-            print("ok_r_last:", ok_r_last)
-            print("ok_ri_last:", ok_ri_last)
-            print("ok_rain_before_zero:", ok_rain_before_zero)
-            print("ok_r_array:", ok_r_array)
-            print("ok_ri_array:", ok_ri_array)
-            print("X[k, -1, -2]:", X[k, -1, -2])
-            print("expected rain_event[t+1]:", expected_r)
-            print("X[k, -1, -1]:", X[k, -1, -1])
-            print("expected rain_intensity[t+1]:", expected_ri)
+        expected_x = df[x_cols].iloc[i - Config.LAGGED_VALUE + 1:i + 1].to_numpy(dtype="float32")
+        if not np.allclose(X[k], expected_x):
             return False
-
-        print(
-            f"✅ sample {k} OK | "
-            f"base X: {ts[start_i]} ~ {ts[i]} | "
-            f"rain in X: {ts[next_i]}"
-        )
-
-    print("✅ 檢查通過")
-    print("X[:, :, :-2] = 非 rain features 的 t-L+1 ~ t")
-    print("X[:, -1, -2] = rain_event[t+1]")
-    print("X[:, -1, -1] = rain_intensity[t+1]")
-    print("y = target_mean[t]，假設已經是 t+1")
-    print("r / ri = rain_event / rain_intensity 的 t+1")
-
+        if not np.allclose(y[k], df["target_mean"].iloc[i]):
+            return False
+        if r is not None and not np.isclose(r[k], df["rain_event"].iloc[i + 1]):
+            return False
+        if ri is not None and not np.isclose(ri[k], df["rain_intensity"].iloc[i + 1]):
+            return False
     return True
 
+
+def apply_train_rain_only(
+    X_tr, y_tr, sw_tr,
+    X_va, y_va, sw_va,
+    X_te, y_te, sw_te,
+    X_va_infer, X_te_infer,
+    rain_intensity_va_for_correction,
+    rain_intensity_te_for_correction,
+    masks,
+    r,
+):
+    n_val = len(X_va)
+    n_test = len(X_te)
+
+    r_tr = r[:len(X_tr)]
+    r_va = r[len(X_tr):len(X_tr) + n_val]
+    r_te = r[-n_test:]
+
+    train_mask = r_tr > 0
+    val_mask = r_va > 0
+    test_mask = r_te > 0
+
+    X_tr, y_tr, sw_tr = X_tr[train_mask], y_tr[train_mask], sw_tr[train_mask]
+    X_va, y_va, sw_va = X_va[val_mask], y_va[val_mask], sw_va[val_mask]
+    X_te, y_te, sw_te = X_te[test_mask], y_te[test_mask], sw_te[test_mask]
+
+    X_va_infer = X_va_infer[val_mask]
+    X_te_infer = X_te_infer[test_mask]
+
+    rain_intensity_va_for_correction = rain_intensity_va_for_correction[val_mask]
+    rain_intensity_te_for_correction = rain_intensity_te_for_correction[test_mask]
+
+    masks["val_rain"] = masks["val_rain"][val_mask]
+    masks["test_rain"] = masks["test_rain"][test_mask]
+    masks["val_time"] = masks["val_time"][val_mask]
+    masks["test_time"] = masks["test_time"][test_mask]
+    masks["val_rain_intensity"] = masks["val_rain_intensity"][val_mask]
+    masks["test_rain_intensity"] = masks["test_rain_intensity"][test_mask]
+
+    return (
+        X_tr, y_tr, sw_tr,
+        X_va, y_va, sw_va,
+        X_te, y_te, sw_te,
+        X_va_infer, X_te_infer,
+        rain_intensity_va_for_correction,
+        rain_intensity_te_for_correction,
+        masks,
+    )
 
 if __name__ == "__main__":
     df = du.load_data()
     df = du.generate_labels(df)
     df = du.feature_engineering(df)
-    modes = ["base", "time", "weather", "time_weather"]
-    modes = ["time_weather"]
+    # modes = ["base", "time", "weather", "time_weather"]
+    modes = ["time"]
 
     algorithm = "normal" # "normal", "de", "multistart"
-
-    add_noise_to_rain_intensity = False
-    noise_std_ratio = 0.2
     plot_start = 0
     plot_end = 82
+
+
+    # Noise
+
+    add_noise_to_rain_intensity = Config.ADD_NOISE
+    noise_std_ratio = Config.NOISE_STD_RATIO
+    noise_seed = 42
+
     # Case I.
     case_i_str = ""
-    for i in range (1):
+    for i in range (Config.NUMBER_OF_RUNS):
         for mode in modes:
             case_i_str += f"=== Mode: {mode.upper()} ===\n"
             
@@ -177,18 +155,54 @@ if __name__ == "__main__":
                 ri=ri,
                 train_ratio=Config.TRAIN_RATIO
             )
-            X_tr, y_tr, sw_tr, X_va, y_va, X_te, y_te, _masks, X_scaler = du.split_and_scale(
+            X_tr, y_tr, sw_tr, \
+            X_va, y_va, sw_va, \
+            X_te, y_te, sw_te, \
+            _masks, X_scaler = du.split_and_scale(
                 X, y, r, ri, t
             )
-
-
+            # Rain is auxiliary DIRC data, never a model input.
+            X_va_infer = X_va
+            X_te_infer = X_te
             rain_intensity_va_for_correction = _masks["val_rain_intensity"]
             rain_intensity_te_for_correction = _masks["test_rain_intensity"]
+            if add_noise_to_rain_intensity:
+                rain_intensity_va_for_correction = du.inject_correction_intensity_noise(
+                    rain_intensity_va_for_correction, _masks["val_rain"],
+                    noise_std_ratio=noise_std_ratio, random_state=42,
+                )
+                rain_intensity_te_for_correction = du.inject_correction_intensity_noise(
+                    rain_intensity_te_for_correction, _masks["test_rain"],
+                    noise_std_ratio=noise_std_ratio, random_state=43,
+                )
+
+            if Config.TRAIN_RAIN_ONLY:
+                (
+                    X_tr, y_tr, sw_tr,
+                    X_va, y_va, sw_va,
+                    X_te, y_te, sw_te,
+                    X_va_infer, X_te_infer,
+                    rain_intensity_va_for_correction,
+                    rain_intensity_te_for_correction,
+                    _masks,
+                ) = apply_train_rain_only(
+                    X_tr, y_tr, sw_tr,
+                    X_va, y_va, sw_va,
+                    X_te, y_te, sw_te,
+                    X_va_infer, X_te_infer,
+                    rain_intensity_va_for_correction,
+                    rain_intensity_te_for_correction,
+                    _masks,
+                    r,
+                )
             # Training 
 
             # print(f"mask: {masks['test_rain']}")
-            model = models.train(X_tr, y_tr, sw_tr, X_va, y_va)
-            y_pred = model.predict(X_te, verbose=0)
+            model = models.train(
+                X_tr, y_tr, sw_tr,
+                X_va, y_va, sw_va
+            )
+            y_pred = model.predict(X_te_infer, verbose=0)
 
 
             # ========== Evaluation before correction ==========
@@ -197,17 +211,29 @@ if __name__ == "__main__":
                 "rain": _masks["val_rain"],
                 "rain_intensity": rain_intensity_va_for_correction,
             }
-            y_pred_va = model.predict(X_va, verbose=0)
+            y_pred_va = model.predict(X_va_infer, verbose=0)
 
             # tuning and optimization via validation
+
+            
             best_params, best_loss, best_eval_va = optimization.tune_rain_correction_on_validation(
                 models=models,
                 y_va=y_va,
                 y_pred_va=y_pred_va,
                 masks_va=masks_va,
-                mode=algorithm,  # "normal", "de", "multistart"
-                intensity_p90=intensity_p90_train
+                mode=algorithm,
+                intensity_p90=intensity_p90_train,
+                gate=Config.GATE
             )
+            if add_noise_to_rain_intensity:
+                print("Noise ON")
+                print("val clean ri[:5]:", _masks["val_rain_intensity"][:5])
+                print("val noisy ri[:5]:", rain_intensity_va_for_correction[:5])
+                print("test clean ri[:5]:", _masks["test_rain_intensity"][:5])
+                print("test noisy ri[:5]:", rain_intensity_te_for_correction[:5])
+            else:
+                print("Noise OFF")
+                
             print(f"\n[{algorithm}] best validation loss = {best_loss}")
             print(f"\n[{mode}] best validation params = {best_params}")
 
@@ -244,14 +270,15 @@ if __name__ == "__main__":
             # print(eval_after.round(4))
             case_i_str += f"After correction:\n{eval_after.round(4)}\n\n"
 
+            if Config.PLOT == True:
             # ========== Plot ==========plot_prediction_from_predictions, plot_prediction_to_pdf
-            models.plot_prediction_to_pdf(
-                y_true=y_te,y_pred=y_pred,timestamps=_masks["test_time"], x_axis = "index",
-                rain_mask=_masks["test_rain"],title="Before Rain Residual Correction", start=plot_start, end=plot_end)
+                models.plot_prediction_to_pdf(
+                    y_true=y_te,y_pred=y_pred,timestamps=_masks["test_time"], x_axis = "index",
+                    rain_mask=_masks["test_rain"],title="Before Rain Residual Correction", start=plot_start, end=plot_end)
 
-            models.plot_prediction_to_pdf(y_true=y_te,y_pred=y_pred_adj, x_axis = "index",
-                                                    timestamps=_masks["test_time"],rain_mask=_masks["test_rain"],
-                                                        title="After Rain Residual Correction", start=plot_start, end=plot_end)
+                models.plot_prediction_to_pdf(y_true=y_te,y_pred=y_pred_adj, x_axis = "index",
+                                                        timestamps=_masks["test_time"],rain_mask=_masks["test_rain"],
+                                                            title="After Rain Residual Correction", start=plot_start, end=plot_end)
 
     print("=== Case I. Original Predictions ===")
     print(case_i_str)

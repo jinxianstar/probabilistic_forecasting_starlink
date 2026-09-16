@@ -410,7 +410,7 @@ def inject_rain_intensity_noise_after_scaling(
 def make_dataset(df, feature_cols):
     rain_cols = ["rain_event", "rain_intensity"]
 
-    # 一般特徵：排除 rain，因為 rain 要另外用 t+1 加進 X
+    # 模型輸入排除雨量；下一期雨量僅透過 r / ri 提供給 DIRC。
     x_feature_cols = [c for c in feature_cols if c not in rain_cols]
 
     if "target_mean" in x_feature_cols:
@@ -457,16 +457,7 @@ def make_dataset(df, feature_cols):
                 else 0.0
             )
 
-            # rain block: shape = (L, 2)
-            # 前 L-1 格補 0，最後一格放 t+1 rain
-            rain_block = np.zeros((L, 2), dtype="float32")
-            rain_block[-1, 0] = rain_future
-            rain_block[-1, 1] = rain_intensity_future
-
-            # X 最後兩欄是 future rain
-            X_full = np.concatenate([X_base, rain_block], axis=1)
-
-            X_list.append(X_full)
+            X_list.append(X_base)
 
             # y: target_mean[i]，你前面已經做成 t+1
             y_list.append(data_y[i])
@@ -515,6 +506,53 @@ def make_dataset(df, feature_cols):
 
 #     return scale(X_tr), y_tr, sw_tr, scale(X_va), y_va, scale(X_te), y_te, masks, X_scaler
 
+# def split_and_scale(X, y, r, ri, timestamps):
+#     n = len(X)
+#     tr = int(n * Config.TRAIN_RATIO)
+#     va = int(n * (Config.TRAIN_RATIO + Config.VAL_RATIO))
+
+#     X_tr, y_tr, t_tr = X[:tr], y[:tr], timestamps[:tr]
+#     X_va, y_va, t_va = X[tr:va], y[tr:va], timestamps[tr:va]
+#     X_te, y_te, t_te = X[va:], y[va:], timestamps[va:]
+
+#     r_tr = r_va = r_te = None
+#     if r is not None:
+#         r_tr, r_va, r_te = r[:tr], r[tr:va], r[va:]
+
+#     ri_tr = ri_va = ri_te = None
+#     if ri is not None:
+#         ri_tr, ri_va, ri_te = ri[:tr], ri[tr:va], ri[va:]
+
+#     N, T, F = X_tr.shape
+#     X_scaler = RobustScaler()
+#     X_scaler.fit(X_tr.reshape(-1, F))
+
+#     def scale(A):
+#         return X_scaler.transform(A.reshape(-1, F)).reshape(A.shape)
+
+#     # sample weight
+#     if r_tr is not None:
+#         sw_tr = np.ones(len(r_tr), dtype=np.float32)
+#         sw_tr[r_tr > 0] = Config.RAIN_WEIGHT
+#     else:
+#         sw_tr = np.ones(len(X_tr), dtype=np.float32)
+
+#     masks = {
+#         "val_rain": (r_va > 0).astype(bool) if r_va is not None else None,
+#         "test_rain": (r_te > 0).astype(bool) if r_te is not None else None,
+#         "val_rain_intensity": ri_va if ri_va is not None else None,
+#         "test_rain_intensity": ri_te if ri_te is not None else None,
+#         "val_time": t_va,
+#         "test_time": t_te,
+#     }
+
+#     return (
+#         scale(X_tr), y_tr, sw_tr,
+#         scale(X_va), y_va,
+#         scale(X_te), y_te,
+#         masks, X_scaler
+#     )
+
 def split_and_scale(X, y, r, ri, timestamps):
     n = len(X)
     tr = int(n * Config.TRAIN_RATIO)
@@ -539,12 +577,20 @@ def split_and_scale(X, y, r, ri, timestamps):
     def scale(A):
         return X_scaler.transform(A.reshape(-1, F)).reshape(A.shape)
 
-    # sample weight
+    # sample weights for train / validation
     if r_tr is not None:
         sw_tr = np.ones(len(r_tr), dtype=np.float32)
         sw_tr[r_tr > 0] = Config.RAIN_WEIGHT
+
+        sw_va = np.ones(len(r_va), dtype=np.float32)
+        sw_va[r_va > 0] = Config.RAIN_WEIGHT
+
+        sw_te = np.ones(len(r_te), dtype=np.float32)
+        sw_te[r_te > 0] = Config.RAIN_WEIGHT
     else:
         sw_tr = np.ones(len(X_tr), dtype=np.float32)
+        sw_va = np.ones(len(X_va), dtype=np.float32)
+        sw_te = np.ones(len(X_te), dtype=np.float32)
 
     masks = {
         "val_rain": (r_va > 0).astype(bool) if r_va is not None else None,
@@ -557,8 +603,8 @@ def split_and_scale(X, y, r, ri, timestamps):
 
     return (
         scale(X_tr), y_tr, sw_tr,
-        scale(X_va), y_va,
-        scale(X_te), y_te,
+        scale(X_va), y_va, sw_va,
+        scale(X_te), y_te, sw_te,
         masks, X_scaler
     )
 
@@ -572,3 +618,12 @@ def get_masks(df, mode):
         X, y, r, ri, t
     )
     return masks
+
+def inject_correction_intensity_noise(rain_intensity, rain_mask, noise_std_ratio=0.05, random_state=42):
+    """Perturb DIRC intensity only, without changing model inputs."""
+    intensity = np.asarray(rain_intensity, dtype=float).copy()
+    rainy = np.asarray(rain_mask, dtype=bool)
+    rng = np.random.default_rng(random_state)
+    std = noise_std_ratio * np.maximum(np.abs(intensity[rainy]), 1e-6)
+    intensity[rainy] += rng.normal(0.0, std, size=rainy.sum())
+    return np.maximum(intensity, 0.0)
